@@ -1,0 +1,378 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#Installing packages and loading libraries
+```{r}
+#install.packages("deSolve")
+#install.packages("FME")
+#install.packages("DEoptim")
+library(tidyverse)
+library(phyloseq)
+library(FME)
+library(deSolve)
+library(DEoptim)
+```
+
+#Reading phyloseq
+```{r}
+### ============================================================
+### 1. Load + preprocess data
+### ============================================================
+
+# Read phyloseq object
+ps.cln <- readRDS("/Users/aryagautam/Desktop/Academics/Fall 2025/Calculating Biological Quantites/metaphlan.combinedb1b2b3.infants.rds")
+
+ps.melt <- psmelt(ps.cln)
+
+retain <- c("Bifidobacterium_longum",
+            "Bifidobacterium_breve",
+            "Bifidobacterium_bifidum")
+
+ps.melt <- ps.melt %>% filter(Species %in% retain)
+
+# Fix timepoints
+tp_map <- c(`1`=0.5, `2`=1, `3`=1.5, `4`=2, `5`=2.5, `6`=3,
+            `8`=9, `9`=6, `12`=9, `15`=12)
+
+ps.melt$TIMEPOINT <- recode(as.character(ps.melt$TIMEPOINT), !!!tp_map) %>% as.numeric()
+
+# Average by lifestyle
+ps.melt2 <- aggregate(Abundance ~ LIFESTYLE + Species + TIMEPOINT, 
+                      data = ps.melt, mean)
+
+# choose lifestyle
+obs_raw <- ps.melt2 %>% filter(LIFESTYLE == "Urban")
+
+obs <- obs_raw %>%
+  pivot_wider(names_from = Species, values_from = Abundance) %>%
+  arrange(TIMEPOINT)
+
+obs <- obs %>%
+  rename(N1 = Bifidobacterium_longum,
+         N2 = Bifidobacterium_bifidum,
+         N3 = Bifidobacterium_breve)
+
+```
+
+#Visualize
+```{r}
+### ============================================================
+### 2. Visualize raw relative abundances
+### ============================================================
+ggplot(ps.melt, aes(x = TIMEPOINT, y = Abundance, color = Species)) + 
+  facet_wrap(~LIFESTYLE) + 
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun.data = mean_se, geom = "pointrange", linewidth = 0.8) +
+  theme_minimal() +scale_x_continuous(limits = c(0, 12))+
+  labs(
+    x = "Age(months)",
+    y = "Relative abundance",
+    title = "Average abundance of Bifidobacterium species over time",
+    color = "Species"
+  )
+
+
+
+```
+
+#ODE Solver
+```{r}
+### ============================================================
+### 3.  Set abundances
+### ============================================================
+times <- obs$TIMEPOINT
+state0 <- c(N1 = obs$N1[1],
+            N2 = obs$N2[1],
+            N3 = obs$N3[1])
+
+### ============================================================
+### 4.  Define gLV model
+### ============================================================
+gLV <- function(t, state, pars) {
+  p <- as.list(pars)
+  with(as.list(c(state, p)), {
+    # Positivity floor
+    N1 <- max(N1, 1e-8)
+    N2 <- max(N2, 1e-8)
+    N3 <- max(N3, 1e-8)
+    
+    # Logistic + interactions
+    dN1 <- N1 * (r1 * (1 - N1 / K1) + a12 * N2 + a13 * N3)
+    dN2 <- N2 * (r2 * (1 - N2 / K2) + a21 * N1 + a23 * N3)
+    dN3 <- N3 * (r3 * (1 - N3 / K3) + a31 * N1 + a32 * N2)
+    
+    list(c(dN1, dN2, dN3))
+  })
+}
+### ============================================================
+### 5. Optimization function 
+### ============================================================
+objective_log <- function(par, times, obs, state0) {
+  names(par) <- names(params_init)
+  
+  # Try lsoda first
+  out <- try(
+    ode(y = state0, times = times, func = gLV, parms = par,
+        method = "lsoda", atol = 1e-8, rtol = 1e-8, maxsteps = 1e6),
+    silent = TRUE
+  )
+  
+  # If lsoda fails, try radau (stiff solver)
+  if (inherits(out, "try-error") || nrow(out) != length(times)) {
+    out <- try(
+      ode(y = state0, times = times, func = gLV, parms = par,
+          method = "radau", atol = 1e-8, rtol = 1e-8),
+      silent = TRUE
+    )
+  }
+  
+  # If still failing, return huge penalty
+  if (inherits(out, "try-error") || nrow(out) != length(times)) {
+    return(1e12)
+  }
+  
+  # Extract predictions
+  pred <- out[, c("N1", "N2", "N3"), drop = FALSE]
+  obs_matrix <- as.matrix(obs[, c("N1", "N2", "N3")])
+  
+  # Check for unrealistic values
+  if (any(pred < 0) || any(pred > 500) || any(!is.finite(pred))) {
+    return(1e12)
+  }
+  
+  # Log-scale error (weights small and large populations equally)
+  epsilon <- 0.01
+  log_pred <- log(pred + epsilon)
+  log_obs <- log(obs_matrix + epsilon)
+  
+  if (any(!is.finite(log_pred)) || any(!is.finite(log_obs))) {
+    return(1e12)
+  }
+  
+  sse_log <- sum((log_pred - log_obs)^2)
+  
+  return(if (is.finite(sse_log)) sse_log else 1e12)
+}
+
+### ============================================================
+### 6. Parameter bounds + optimization
+### ============================================================
+params_init <- c(
+  r1 = 0.8,   r2 = 0.2,   r3 = 0.2,     # N1 grows fast initially
+  K1 = 80,    K2 = 12,    K3 = 8,       # Based on max observed
+  a12 = -0.03, a13 = -0.03,             # N2, N3 suppress N1 weakly
+  a21 = -0.08, a23 = 0.01,              # N1 suppresses N2 strongly
+  a31 = -0.05, a32 = 0.01               # N1 suppresses N3 moderately
+)
+
+lower <- c(
+  r1 = 0.1,   r2 = 0.01,  r3 = 0.01,
+  K1 = 60,    K2 = 8,     K3 = 5,
+  a12 = -0.2, a13 = -0.2,               # N1 can be suppressed
+  a21 = -0.3, a23 = -0.1,               # N1 strongly suppresses others
+  a31 = -0.3, a32 = -0.1
+)
+
+upper <- c(
+  r1 = 2.0,   r2 = 0.5,   r3 = 0.5,
+  K1 = 100,   K2 = 15,    K3 = 12,
+  a12 = -0.001, a13 = -0.001,           # Weak suppression of N1
+  a21 = -0.01,  a23 = 0.2,              # Weak suppression, slight facilitation
+  a31 = -0.01,  a32 = 0.2
+)
+
+# Run DEoptim 
+test_sse <- objective_log(params_init, times, obs, state0)
+
+fit_de <- DEoptim(
+  fn = objective_log,
+  lower = lower,
+  upper = upper,
+  control = DEoptim.control(
+  itermax = 400,
+  trace = 25,
+  NP = 150,
+  CR = 0.9,
+  F = 0.8,
+  strategy = 3,           
+  storepopfrom = 350      
+  ),
+  times = times,
+  obs = obs,
+  state0 = state0
+)
+
+final_par <- fit_de$optim$bestmem
+names(final_par) <- names(params_init)
+
+### ============================================================
+### 7. Simulate using fitted parameters
+### ============================================================
+sim_times <- seq(0.5, 12, length.out = 200)
+sim <- ode(
+  y = state0,
+  times = sim_times,
+  func = gLV,
+  parms = final_par,
+  method = "lsoda"
+)
+
+sim_df <- as.data.frame(sim) %>%
+  pivot_longer(cols = c("N1", "N2", "N3"), 
+               names_to = "Species", 
+               values_to = "Value")
+
+obs_long <- obs %>%
+  pivot_longer(cols = c("N1", "N2", "N3"),
+               names_to = "Species",
+               values_to = "Value") %>%
+  rename(time = TIMEPOINT)
+
+### ============================================================
+### 8. Plot
+### ============================================================
+ggplot() +
+  geom_line(data = sim_df, aes(x = time, y = Value, color = Species), 
+            linewidth = 1.2) +
+  geom_point(data = obs_long, aes(x = time, y = Value, color = Species), 
+             size = 3, alpha = 0.8) +
+  scale_y_log10(labels = scales::comma) +
+  scale_color_manual(
+    values = c(N1 = "#619CFF", N2 = "#F8766D", N3 = "#00BA38"),
+    labels = c(N1 = "B. longum", N2 = "B. bifidum", N3 = "B. breve")
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "gLV Model Fit (Log Scale)",
+    subtitle = paste("Log-SSE:", round(fit_de$optim$bestval, 2)),
+    y = "Abundance (log scale)", 
+    x = "Time"
+  ) +
+  theme(legend.position = "bottom")
+
+ggplot() +
+  geom_line(data = sim_df, aes(x = time, y = Value, color = Species), 
+            linewidth = 1.2) +
+  geom_point(data = obs_long, aes(x = time, y = Value, color = Species), 
+             size = 3, alpha = 0.8) +
+  scale_color_manual(
+    values = c(N1 = "#619CFF", N2 = "#F8766D", N3 = "#00BA38"),
+    labels = c(N1 = "B. longum", N2 = "B. bifidum", N3 = "B. breve")
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "gLV Model Fit (Linear Scale)",
+    subtitle = paste("Log-SSE:", round(fit_de$optim$bestval, 2)),
+    y = "Abundance", 
+    x = "Time"
+  ) +
+  theme(legend.position = "bottom")
+
+### ============================================================
+### 9. Simulate ahead
+### ============================================================
+
+forward_times <- seq(0.5, 14, length.out = 2000)
+
+sim_forward <- ode(
+  y = state0,
+  times = forward_times,
+  func = gLV,
+  parms = final_par,
+  method = "lsoda"
+)
+
+# long_times <- seq(max(times), 1000, length.out = 2000)   
+# sim_long <- tryCatch({
+#   ode(y = state0, times = long_times, func = gLV, parms = final_par, method = "vode",
+#       atol=1e-9, rtol=1e-9)
+# }, error = function(e) {
+#   ode(y = state0, times = long_times, func = gLV, parms = final_par, method = "bdf",
+#       atol=1e-8, rtol=1e-8)
+# })
+# 
+# sim_long_df <- as.data.frame(sim_long)
+
+sim_forward_df <- as.data.frame(sim_forward) %>%
+  pivot_longer(cols = c("N1", "N2", "N3"),
+               names_to = "Species",
+               values_to = "Value")
+
+ggplot(sim_forward_df) +
+  geom_line(aes(x = time, y = Value, color = Species), linewidth = 1.2) +
+  scale_color_manual(
+    values = c(N1 = "#619CFF", N2 = "#F8766D", N3 = "#00BA38"),
+    labels = c(N1 = "B. longum", N2 = "B. bifidum", N3 = "B. breve")
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Forward Simulation to Equilibrium",
+    y = "Abundance (log scale)",
+    x = "Time"
+  )
+
+
+```
+
+#Equilibria and stability
+```{r}
+#Define parameters
+r1  <- final_par["r1"]
+r2  <- final_par["r2"]
+r3  <- final_par["r3"]
+
+K1 <- final_par["K1"]
+K2 <- final_par["K2"]
+K3 <- final_par["K3"]
+
+a12 <- final_par["a12"]
+a13 <- final_par["a13"]
+a21 <- final_par["a21"]
+
+a23 <- final_par["a23"]
+a31 <- final_par["a31"]
+a32 <- final_par["a32"]
+
+# -------------------------------------------
+# 1. Solve interior equilibrium N*
+# -------------------------------------------
+M <- matrix(c(
+  -r1/K1,   a12,     a13,
+   a21,   -r2/K2,    a23,
+   a31,     a32,   -r3/K3
+), nrow=3, byrow=TRUE)
+
+b <- -c(r1, r2, r3)
+
+# Solve for equilibrium abundances
+Neq <- solve(M, b)
+Neq
+
+# -------------------------------------------
+# 2. Build Jacobian at equilibrium
+# -------------------------------------------
+N1 <- Neq[1]; N2 <- Neq[2]; N3 <- Neq[3]
+
+J <- matrix(0, nrow = 3, ncol = 3)
+# diag
+J[1,1] <- r1*(1 - 2*N1/K1) + a12 * N2 + a13 * N3
+J[2,2] <- r2*(1 - 2*N2/K2) + a21 * N1 + a23 * N3
+J[3,3] <- r3*(1 - 2*N3/K3) + a31 * N1 + a32 * N2
+# off-diagonals
+J[1,2] <- a12 * N1
+J[1,3] <- a13 * N1
+J[2,1] <- a21 * N2
+J[2,3] <- a23 * N2
+J[3,1] <- a31 * N3
+J[3,2] <- a32 * N3
+
+# -------------------------------------------
+# 3. Stability check
+# -------------------------------------------
+eigen(J)$values
+
+
+```
